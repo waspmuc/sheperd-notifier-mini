@@ -11,58 +11,122 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 PORT = int(os.environ.get("PORT", "8000"))
+STATE_FILE = "/tmp/shepherd_state.json"
+
+# {svc_full: {"digest": "abc123", "commit_sha": "deadbeef..."}}
+_state: dict = {}
 
 
-def get_commits(image: str, tag: str) -> list[str]:
-    """Fetch last 3 commit messages for the deployed image repo."""
-    if not GITHUB_TOKEN:
-        return []
-    match = re.match(r"ghcr\.io/([^/]+)/([^:@\s]+)", image)
-    if not match:
-        return []
-    owner, repo = match.group(1), match.group(2)
-    branch = "staging" if tag == "staging" else "main"
-    url = f"https://api.github.com/repos/{owner}/{repo}/commits?sha={branch}&per_page=3"
+def load_state() -> None:
+    global _state
+    try:
+        with open(STATE_FILE) as f:
+            _state = json.load(f)
+    except Exception:
+        _state = {}
+
+
+def save_state() -> None:
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(_state, f)
+    except Exception as e:
+        print(f"State save error: {e}", flush=True)
+
+
+def _gh_request(url: str) -> object:
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": "shepherd-notifier",
     })
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def get_commits_since(owner: str, repo: str, branch: str, since_sha: str) -> list[str]:
+    """Fetch commits on branch newer than since_sha (up to 10)."""
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            commits = json.loads(resp.read())
-            return [c["commit"]["message"].split("\n")[0] for c in commits]
+        data = _gh_request(
+            f"https://api.github.com/repos/{owner}/{repo}/compare/{since_sha}...{branch}"
+        )
+        commits = data.get("commits", [])
+        return [c["commit"]["message"].split("\n")[0] for c in reversed(commits[-10:])]
     except Exception as e:
-        print(f"GitHub API error: {e}", flush=True)
+        print(f"GitHub compare error: {e}", flush=True)
         return []
 
 
-def format_message(title: str, body: str, notify_type: str) -> str:
-    is_staging = "staging" in title.lower()
+def get_recent_commits(owner: str, repo: str, branch: str, n: int = 3) -> list[str]:
+    """Fetch last n commits from branch."""
+    try:
+        commits = _gh_request(
+            f"https://api.github.com/repos/{owner}/{repo}/commits?sha={branch}&per_page={n}"
+        )
+        return [c["commit"]["message"].split("\n")[0] for c in commits]
+    except Exception as e:
+        print(f"GitHub commits error: {e}", flush=True)
+        return []
+
+
+def get_latest_commit_sha(owner: str, repo: str, branch: str) -> str:
+    try:
+        commits = _gh_request(
+            f"https://api.github.com/repos/{owner}/{repo}/commits?sha={branch}&per_page=1"
+        )
+        return commits[0]["sha"] if commits else ""
+    except Exception as e:
+        print(f"GitHub sha error: {e}", flush=True)
+        return ""
+
+
+def parse_body(body: str) -> tuple[str, str]:
+    """Return (from_image_ref, to_image_ref) from shepherd body."""
+    # Shepherd body: "Updating service X from IMAGE_OLD to IMAGE_NEW"
+    # or just:       "... updated to IMAGE_NEW"
+    to_m = re.search(r"\bto (ghcr\.io/\S+)", body)
+    from_m = re.search(r"\bfrom (ghcr\.io/\S+)\s+to\b", body)
+    return (
+        from_m.group(1) if from_m else "",
+        to_m.group(1) if to_m else "",
+    )
+
+
+def short_digest(image_ref: str) -> str:
+    m = re.search(r"sha256:([a-f0-9]{8})", image_ref)
+    return m.group(1) if m else ""
+
+
+def owner_repo(image_ref: str) -> tuple[str, str]:
+    m = re.match(r"ghcr\.io/([^/]+)/([^:@\s]+)", image_ref)
+    return (m.group(1), m.group(2)) if m else ("", "")
+
+
+def format_message(title: str, body: str, notify_type: str) -> str | None:
+    """Return formatted Telegram message, or None to skip."""
+    print(f"title={title!r}", flush=True)
+    print(f"body={body!r}", flush=True)
+
     is_failure = notify_type == "failure"
+    is_staging = "staging" in title.lower()
 
-    if is_failure:
-        icon = "❌"
-    elif is_staging:
-        icon = "🚧"
-    else:
-        icon = "🚀"
-
-    env = "Staging" if is_staging else "Prod"
-
-    # Service-Kurzname
-    svc_match = re.search(r"Service (\S+) (?:updated|update failed)", title)
-    svc_full = svc_match.group(1) if svc_match else "unknown"
+    svc_m = re.search(r"Service (\S+) (?:updated|update failed)", title)
+    svc_full = svc_m.group(1) if svc_m else title.strip()
     svc = svc_full.rsplit("-", 1)[-1]
 
-    # Image-Info aus Body
-    to_part = body.split(" to ")[-1] if " to " in body else ""
-    image_match = re.match(r"(ghcr\.io/\S+?)(?:@|$)", to_part)
-    image = image_match.group(1) if image_match else ""
-    tag_match = re.search(r":(\w+)(?:@|$)", to_part)
-    tag = tag_match.group(1) if tag_match else ""
-    digest_match = re.search(r"sha256:([a-f0-9]{8})", to_part)
-    digest = digest_match.group(1) if digest_match else ""
+    from_ref, to_ref = parse_body(body)
+    new_digest = short_digest(to_ref)
+    old_digest = short_digest(from_ref)
+
+    # Skip restart: same digest, no failure
+    prev = _state.get(svc_full, {})
+    prev_digest = prev.get("digest", "")
+    if not is_failure and new_digest and prev_digest == new_digest:
+        print(f"Skip restart for {svc_full} (digest unchanged: {new_digest})", flush=True)
+        return None
+
+    icon = "❌" if is_failure else ("🚧" if is_staging else "🚀")
+    env = "Staging" if is_staging else "Prod"
 
     if is_failure:
         lines = [
@@ -72,17 +136,33 @@ def format_message(title: str, body: str, notify_type: str) -> str:
         ]
     else:
         lines = [f"{icon} <b>{env} — {html.escape(svc)} aktualisiert</b>"]
-        if tag:
-            lines.append(f"Tag: <code>{html.escape(tag)}</code>")
-        if digest:
-            lines.append(f"ID: <code>{digest}</code>")
 
-        commits = get_commits(image, tag)
-        if commits:
-            lines.append("")
-            lines.append("Commits:")
-            for msg in commits:
-                lines.append(f"• {html.escape(msg)}")
+        # From → To digest
+        if old_digest and old_digest != new_digest:
+            lines.append(f"<code>{old_digest}</code> → <code>{new_digest}</code>")
+        elif new_digest:
+            lines.append(f"ID: <code>{new_digest}</code>")
+
+        # Commits
+        if GITHUB_TOKEN and to_ref:
+            owner, repo = owner_repo(to_ref)
+            if owner and repo:
+                branch = "staging" if is_staging else "main"
+                prev_sha = prev.get("commit_sha", "")
+                if prev_sha:
+                    commits = get_commits_since(owner, repo, branch, prev_sha)
+                else:
+                    commits = get_recent_commits(owner, repo, branch, 3)
+
+                if commits:
+                    lines.append("")
+                    for msg in commits:
+                        lines.append(f"• {html.escape(msg)}")
+
+                # Update state
+                new_sha = get_latest_commit_sha(owner, repo, branch)
+                _state[svc_full] = {"digest": new_digest, "commit_sha": new_sha}
+                save_state()
 
     return "\n".join(lines)
 
@@ -114,8 +194,9 @@ class Handler(BaseHTTPRequestHandler):
             title = data.get("title", "")
             body = data.get("body", "")
             notify_type = data.get("notify_type", "success")
-            print(f"Notify: {title}", flush=True)
-            send_telegram(format_message(title, body, notify_type))
+            msg = format_message(title, body, notify_type)
+            if msg:
+                send_telegram(msg)
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
@@ -130,5 +211,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    load_state()
     print(f"shepherd-notifier listening on :{PORT}", flush=True)
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
