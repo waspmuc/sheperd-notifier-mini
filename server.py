@@ -223,7 +223,8 @@ def format_message(title: str, body: str, notify_type: str) -> str | None:
 
                 # Get the actual deployed commit SHA from the image label
                 digest = full_digest(to_ref)
-                new_sha = get_sha_from_ghcr(digest, owner, repo) or get_latest_commit_sha(owner, repo, branch)
+                new_sha = (get_sha_from_ghcr(digest, owner, repo) or get_latest_commit_sha(owner, repo, branch)).strip()
+                print(f"new_sha={new_sha!r}", flush=True)
 
                 if new_sha:
                     lines.append(f"v1.0.{new_sha[:7]}")
@@ -232,7 +233,10 @@ def format_message(title: str, body: str, notify_type: str) -> str | None:
                     commits = get_commits_since(owner, repo, prev_sha, new_sha)
                     app_changed = is_app_relevant(owner, repo, prev_sha, new_sha)
                 else:
-                    commits = get_recent_commits(owner, repo, new_sha or branch, 3)
+                    # try with sha first, fall back to branch name
+                    commits = get_recent_commits(owner, repo, new_sha, 3) if new_sha else []
+                    if not commits:
+                        commits = get_recent_commits(owner, repo, branch, 3)
                     app_changed = True
 
                 if commits:
