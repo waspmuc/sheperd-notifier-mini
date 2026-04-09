@@ -143,12 +143,17 @@ def format_message(title: str, body: str, notify_type: str) -> str | None:
         elif new_digest:
             lines.append(f"ID: <code>{new_digest}</code>")
 
-        # Commits
+        # Commits + Version
         if GITHUB_TOKEN and to_ref:
             owner, repo = owner_repo(to_ref)
             if owner and repo:
                 branch = "staging" if is_staging else "main"
                 prev_sha = prev.get("commit_sha", "")
+
+                new_sha = get_latest_commit_sha(owner, repo, branch)
+                if new_sha:
+                    lines.append(f"v1.0.{new_sha[:7]}")
+
                 if prev_sha:
                     commits = get_commits_since(owner, repo, branch, prev_sha)
                 else:
@@ -160,7 +165,6 @@ def format_message(title: str, body: str, notify_type: str) -> str | None:
                         lines.append(f"• {html.escape(msg)}")
 
                 # Update state
-                new_sha = get_latest_commit_sha(owner, repo, branch)
                 _state[svc_full] = {"digest": new_digest, "commit_sha": new_sha}
                 save_state()
 
