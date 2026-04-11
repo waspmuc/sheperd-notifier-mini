@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_READ_TOKEN", "")
 PORT = int(os.environ.get("PORT", "8000"))
 STATE_FILE = "/tmp/shepherd_state.json"
 
